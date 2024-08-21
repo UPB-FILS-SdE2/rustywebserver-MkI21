@@ -40,6 +40,7 @@ async fn main() -> io::Result<()> {
     }
 }
 
+// Handle HTTP requests
 async fn handle_request(stream: TcpStream, root_folder: PathBuf) -> io::Result<()> {
     let mut buffer = [0; 4096];
     let mut stream = stream;
@@ -65,7 +66,7 @@ async fn handle_request(stream: TcpStream, root_folder: PathBuf) -> io::Result<(
     }
 
     let method = parts[0];
-    let file_path = root_folder.join(&parts[1][1..]); // Remove the leading '/' and join with root folder
+    let file_path = root_folder.join(parts[1].trim_start_matches('/'));
     let http_version = parts[2];
 
     let forbidden_files = vec![root_folder.join("forbidden.html")];
@@ -211,6 +212,10 @@ fn log_connection(
     status_code: &str,
     status_text: &str,
 ) {
+    // Move cursor to the beginning of the line
+    print!("\x1B[1A\x1B[2K"); // Moves cursor up one line and clears that line
+
+    // Print the new log line
     if let Ok(remote_addr) = stream.peer_addr() {
         println!(
             "{} {} {} -> {} ({})",
