@@ -35,6 +35,7 @@ async fn main() -> io::Result<()> {
     }
 }
 
+
 async fn handle_request(stream: TcpStream, root_folder: PathBuf) -> io::Result<()> {
     let mut buffer = [0; 4096];
     let mut stream = stream;
@@ -62,7 +63,7 @@ async fn handle_request(stream: TcpStream, root_folder: PathBuf) -> io::Result<(
     let file_path = root_folder.join(requested_path);
     let http_version = parts[2];
 
-    // Check for forbidden access
+    // Vérifier l'accès interdit
     if file_path.starts_with(root_folder.join("forbidden")) {
         let status_code = "403";
         let status_text = "Forbidden";
@@ -71,7 +72,8 @@ async fn handle_request(stream: TcpStream, root_folder: PathBuf) -> io::Result<(
         return Ok(());
     }
 
-    let _response = if file_path.is_dir() {
+    // Traiter les fichiers et répertoires
+    if file_path.is_dir() {
         match generate_directory_listing(&file_path).await {
             Ok(html) => {
                 let status_code = "200";
@@ -94,7 +96,10 @@ async fn handle_request(stream: TcpStream, root_folder: PathBuf) -> io::Result<(
                 let mime_type = get_mime_type(&file_path);
                 let status_code = "200";
                 let status_text = "OK";
-                let header = format!("{} {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", http_version, status_code, status_text, mime_type, contents.len());
+                let header = format!(
+                    "{} {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    http_version, status_code, status_text, mime_type, contents.len()
+                );
                 stream.write_all(header.as_bytes()).await?;
                 stream.write_all(&contents).await?;
                 log_connection(method, &stream, requested_path, status_code, status_text).await;
@@ -114,8 +119,9 @@ async fn handle_request(stream: TcpStream, root_folder: PathBuf) -> io::Result<(
         stream.write_all(format!("{} {} {}\r\nConnection: close\r\n\r\n", http_version, status_code, status_text).as_bytes()).await?;
         log_connection(method, &stream, requested_path, status_code, status_text).await;
         return Ok(());
-    };
+    }
 }
+
 
 async fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path)
@@ -123,16 +129,17 @@ async fn read_file(path: &Path) -> io::Result<Vec<u8>> {
 
 fn get_mime_type(path: &Path) -> &'static str {
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("html") => "text/html",
-        Some("css") => "text/css",
-        Some("js") => "application/javascript",
-        Some("png") => "image/png",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
         Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("zip") => "application/zip",
         _ => "application/octet-stream",
     }
 }
+
 
 async fn generate_directory_listing(path: &Path) -> io::Result<String> {
     let mut html = String::from("<html><body><h1>Directory listing</h1><ul>");
