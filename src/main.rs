@@ -1,10 +1,11 @@
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
@@ -21,6 +22,7 @@ async fn main() -> io::Result<()> {
         .canonicalize()
         .expect("Invalid root folder path");
 
+    // Print root folder and server listening message once
     println!("Root folder: {:?}", root_folder.display());
     println!("Server listening on 0.0.0.0:{}", port);
 
@@ -36,6 +38,10 @@ async fn main() -> io::Result<()> {
         });
     }
 }
+
+
+use std::collections::HashMap;
+
 
 async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Result<()> {
     let mut buffer = [0; 4096];
@@ -244,7 +250,6 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
 }
 
 
-
 async fn execute_script(
     script_path: PathBuf,
     stream: &mut TcpStream,
@@ -252,8 +257,8 @@ async fn execute_script(
     headers: &HashMap<String, String>,
     method: &str,
     requested_path: &str,
-    query_string: Option<&str>,
-    post_data: Option<&str>,
+    query_string: Option<&str>,  // Optional query string
+    post_data: Option<&str>,     // Optional POST data
 ) -> io::Result<(&'static str, &'static str)> {
     // Prepare environment variables
     let mut env_vars = HashMap::new();
@@ -277,77 +282,91 @@ async fn execute_script(
         }
     }
 
-    // Add POST data to environment variables
-    if let Some(data) = post_data {
-        env_vars.insert("POST_DATA".to_string(), data.to_string());
+    // Add POST data if present
+    if method == "POST" {
+        if let Some(data) = post_data {
+            for param in data.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    let var_name = format!("Query_{}", key);
+                    env_vars.insert(var_name, value.to_string());
+                }
+            }
+        }
     }
 
     // Execute the script
-    let mut command = Command::new(script_path);
-    command.envs(&env_vars);
+    let mut command = Command::new(&script_path);
 
-    let output = command.output().await?;
-    if output.status.success() {
-        let response = String::from_utf8_lossy(&output.stdout);
-        let response_bytes = response.as_bytes(); // Create a longer-lived reference
-
-        let status_code = "200";
-        let status_text = "OK";
-        let header = format!(
-            "{} {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n",
-            http_version, status_code, status_text
-        );
-        stream.write_all(header.as_bytes()).await?;
-        stream.write_all(response_bytes).await?; // Use the longer-lived reference
-        return Ok((status_code, status_text));
-    } else {
-        let response = String::from_utf8_lossy(&output.stderr);
-        let response_bytes = response.as_bytes(); // Create a longer-lived reference
-
-        let status_code = "500";
-        let status_text = "Internal Server Error";
-        let header = format!(
-            "{} {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n",
-            http_version, status_code, status_text
-        );
-        stream.write_all(header.as_bytes()).await?;
-        stream.write_all(response_bytes).await?; // Use the longer-lived reference
-        return Ok((status_code, status_text));
+    // Set environment variables for the command
+    for (key, value) in env_vars {
+        command.env(key, value);
     }
+
+    // Capture output (stdout and stderr)
+    let output = command.output().await?;
+
+    let status_code = if output.status.success() {
+        "200"
+    } else {
+        "500"
+    };
+    let status_text = if output.status.success() {
+        "OK"
+    } else {
+        "Internal Server Error"
+    };
+
+    let mut response_headers = vec![
+        format!("{} {} {}", http_version, status_code, status_text),
+        "Connection: close".to_string(),
+    ];
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.is_empty() {
+            // The first empty line indicates the end of headers
+            break;
+        }
+        response_headers.push(line.to_string());
+    }
+
+    let body_start = stdout.find("\n\n").unwrap_or(0) + 2;
+    let body = &stdout[body_start..];
+
+    // Prepare the full response
+    let response = format!(
+        "{}\r\n\r\n{}",
+        response_headers.join("\r\n"),
+        body
+    );
+
+    // Send the response
+    stream.write_all(response.as_bytes()).await?;
+
+    Ok((status_code, status_text))
 }
 
 
 
-async fn generate_directory_listing(
-    dir: &Path,
-    root_folder: &Path,
-) -> io::Result<String> {
-    let mut entries = vec![];
-    let root = root_folder.to_string_lossy();
 
-    for entry in fs::read_dir(dir)? {
+async fn generate_directory_listing(path: &Path, root_folder: &Path) -> io::Result<String> {
+    let mut html = String::from("<html><body><h1>Directory listing</h1><ul>");
+    for entry in fs::read_dir(path)? {
         let entry = entry?;
         let path = entry.path();
-        let rel_path = path.strip_prefix(root_folder).unwrap_or(&path);
-
-        let display_path = rel_path.to_string_lossy().replace('\\', "/");
-        let display_name = entry.file_name().to_string_lossy();
-
-        if path.is_dir() {
-            entries.push(format!("<li><a href=\"{}/\">{}/</a></li>", display_path, display_name));
-        } else {
-            entries.push(format!("<li><a href=\"{}\">{}</a></li>", display_path, display_name));
-        }
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_str()
+            .unwrap_or_default();
+        let relative_path = path.strip_prefix(root_folder).unwrap_or(&path);
+        html.push_str(&format!(
+            "<li><a href=\"{}\">{}</a></li>",
+            relative_path.display(),
+            filename
+        ));
     }
-
-    let list = entries.join("\n");
-
-    let html = format!(
-        "<html><body><h1>Directory listing for {}</h1><ul>{}</ul></body></html>",
-        dir.to_string_lossy(),
-        list
-    );
-
+    html.push_str("</ul></body></html>");
     Ok(html)
 }
 
@@ -356,14 +375,14 @@ async fn read_file(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn get_mime_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|s| s.to_str()) {
-        Some("html") => "text/html",
-        Some("css") => "text/css",
-        Some("js") => "application/javascript",
-        Some("json") => "application/json",
-        Some("png") => "image/png",
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
         Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
+        Some("png") => "image/png",
+        Some("zip") => "application/zip",
         _ => "application/octet-stream",
     }
 }
@@ -371,18 +390,20 @@ fn get_mime_type(path: &Path) -> &'static str {
 async fn log_connection(
     method: &str,
     stream: &TcpStream,
-    path: &str,
+    requested_path: &str,
     status_code: &str,
     status_text: &str,
 ) {
-    if let Ok(peer_addr) = stream.peer_addr() {
+    if let Ok(remote_addr) = stream.peer_addr() {
+        let remote_ip = remote_addr.ip().to_string();
         println!(
-            "{} {} - {} {} - {}",
-            peer_addr,
-            method,
-            path,
-            status_code,
-            status_text
+            "{} {} {} -> {} ({})",
+            method, remote_ip, requested_path, status_code, status_text
+        );
+    } else {
+        println!(
+            "{} unknown {} -> {} ({})",
+            method, requested_path, status_code, status_text
         );
     }
 }
