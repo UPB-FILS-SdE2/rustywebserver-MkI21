@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -64,35 +63,6 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     let file_path = root_folder.join(requested_path);
     let http_version = parts[2];
 
-    // Handle POST requests
-    if method == "POST" {
-        // Extract content length from headers
-        let mut content_length: usize = 0;
-        for line in &lines[1..] {
-            if line.to_lowercase().starts_with("content-length:") {
-                if let Some(len) = line.split(':').nth(1) {
-                    content_length = len.trim().parse().unwrap_or(0);
-                }
-            }
-        }
-
-        // Read the POST data
-        let mut post_data = vec![0; content_length];
-        stream.read_exact(&mut post_data).await?;
-
-        // Process the post_data or respond with it
-        let response = format!(
-            "{} 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            http_version,
-            post_data.len(),
-            String::from_utf8_lossy(&post_data)
-        );
-        stream.write_all(response.as_bytes()).await?;
-        log_connection(method, &stream, requested_path, "200", "OK").await;
-
-        return Ok(());
-    }
-
     // Handle GET requests
     if method == "GET" {
         // Check for forbidden access
@@ -112,17 +82,10 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
             return Ok(());
         }
 
-        let mut headers = HashMap::new();
-        for line in &lines[1..] {
-            if let Some((key, value)) = line.split_once(':') {
-                headers.insert(key.trim().to_string(), value.trim().to_string());
-            }
-        }
-
         // Execute scripts
         if file_path.starts_with(root_folder.join("scripts")) && file_path.is_file() {
             let (status_code, status_text) =
-                match execute_script(file_path, &mut stream, http_version, headers).await {
+                match execute_script(file_path, &mut stream, http_version, method).await {
                     Ok((status_code, status_text)) => (status_code, status_text),
                     Err(e) => {
                         let status_code = "500";
@@ -217,7 +180,7 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
         }
     }
 
-    // If the method is not GET or POST, return 405 Method Not Allowed
+    // If the method is not GET, return 405 Method Not Allowed
     let status_code = "405";
     let status_text = "Method Not Allowed";
     stream
@@ -233,23 +196,19 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     Ok(())
 }
 
+
 async fn execute_script(
     script_path: PathBuf,
     stream: &mut TcpStream,
     http_version: &str,
-    headers: HashMap<String, String>,
+    method: &str, // Pass the HTTP method as an argument
 ) -> io::Result<(&'static str, &'static str)> {
     let mut command = Command::new(&script_path);
 
-    // Set headers as environment variables
-    if let Some(msg) = headers.get("msg") {
-        command.env("msg", msg);
-    }
+    // Pass the HTTP method as an environment variable
+    command.env("REQUEST_METHOD", method);
 
-    if let Some(usr) = headers.get("usr") {
-        command.env("usr", usr);
-    }
-
+    // Capture both stdout and stderr
     let output = command.output().await?;
 
     let status_code = if output.status.success() {
@@ -263,16 +222,13 @@ async fn execute_script(
         "Internal Server Error"
     };
 
-    let headers_response = format!(
-        "{} {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n",
-        http_version, status_code, status_text
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = format!(
+        "{} {} {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+        http_version, status_code, status_text, stdout.trim()
     );
 
-    let body = String::from_utf8_lossy(&output.stdout);
-
-    let response = format!("{}{}", headers_response, body);
     stream.write_all(response.as_bytes()).await?;
-
     Ok((status_code, status_text))
 }
 
