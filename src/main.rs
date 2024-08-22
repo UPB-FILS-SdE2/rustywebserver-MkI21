@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -111,10 +112,17 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
             return Ok(());
         }
 
+        let mut headers = HashMap::new();
+        for line in &lines[1..] {
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+
         // Execute scripts
         if file_path.starts_with(root_folder.join("scripts")) && file_path.is_file() {
             let (status_code, status_text) =
-                match execute_script(file_path, &mut stream, http_version).await {
+                match execute_script(file_path, &mut stream, http_version, headers).await {
                     Ok((status_code, status_text)) => (status_code, status_text),
                     Err(e) => {
                         let status_code = "500";
@@ -229,9 +237,19 @@ async fn execute_script(
     script_path: PathBuf,
     stream: &mut TcpStream,
     http_version: &str,
+    headers: HashMap<String, String>,
 ) -> io::Result<(&'static str, &'static str)> {
     let mut command = Command::new(&script_path);
-    // Capture both stdout and stderr
+
+    // Set headers as environment variables
+    if let Some(msg) = headers.get("msg") {
+        command.env("msg", msg);
+    }
+
+    if let Some(usr) = headers.get("usr") {
+        command.env("usr", usr);
+    }
+
     let output = command.output().await?;
 
     let status_code = if output.status.success() {
@@ -245,28 +263,14 @@ async fn execute_script(
         "Internal Server Error"
     };
 
-    let mut headers = vec![
-        format!("{} {} {}", http_version, status_code, status_text),
-        "Connection: close".to_string(),
-    ];
+    let headers_response = format!(
+        "{} {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n",
+        http_version, status_code, status_text
+    );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let body = String::from_utf8_lossy(&output.stdout);
 
-    for line in stdout.lines() {
-        if line.is_empty() {
-            // The first empty line indicates the end of headers
-            break;
-        }
-        headers.push(line.to_string());
-    }
-
-    let body_start = stdout.find("\n\n").unwrap_or(0) + 2;
-    let body = &stdout[body_start..];
-
-    // Prepare the full response
-    let response = format!("{}\r\n\r\n{}", headers.join("\r\n"), body);
-
-    // Send the response
+    let response = format!("{}{}", headers_response, body);
     stream.write_all(response.as_bytes()).await?;
 
     Ok((status_code, status_text))
