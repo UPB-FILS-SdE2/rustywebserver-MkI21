@@ -239,6 +239,18 @@ async fn execute_script(
 ) -> io::Result<(&'static str, &'static str)> {
     // Prepare environment variables
     let mut env_vars = HashMap::new();
+    
+    // Parse query string and add to env_vars
+    if let Some(query_str) = requested_path.split('?').nth(1) {
+        for param in query_str.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                let var_name = format!("Query_{}", key);
+                env_vars.insert(var_name, value.to_string());
+            }
+        }
+    }
+    
+    // Other headers
     for (key, value) in headers {
         env_vars.insert(key.clone(), value.clone());
     }
@@ -253,7 +265,7 @@ async fn execute_script(
         command.env(key, value);
     }
 
-    // Capture both stdout and stderr
+    // Capture output
     let output = command.output().await?;
 
     let status_code = if output.status.success() {
@@ -275,7 +287,6 @@ async fn execute_script(
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if line.is_empty() {
-            // The first empty line indicates the end of headers
             break;
         }
         response_headers.push(line.to_string());
@@ -284,14 +295,12 @@ async fn execute_script(
     let body_start = stdout.find("\n\n").unwrap_or(0) + 2;
     let body = &stdout[body_start..];
 
-    // Prepare the full response
+    // Send response
     let response = format!(
         "{}\r\n\r\n{}",
         response_headers.join("\r\n"),
         body
     );
-
-    // Send the response
     stream.write_all(response.as_bytes()).await?;
 
     Ok((status_code, status_text))
