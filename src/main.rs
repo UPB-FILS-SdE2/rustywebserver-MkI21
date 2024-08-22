@@ -39,6 +39,10 @@ async fn main() -> io::Result<()> {
     }
 }
 
+
+use std::collections::HashMap;
+
+
 async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Result<()> {
     let mut buffer = [0; 4096];
     let n = stream.read(&mut buffer).await?;
@@ -59,9 +63,17 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     }
 
     let method = parts[0];
-    let requested_path = parts[1].trim_start_matches('/');
-    let file_path = root_folder.join(requested_path);
+    let full_path = parts[1];
     let http_version = parts[2];
+
+    // Extract requested path and query string
+    let (requested_path, query_string) = if let Some(idx) = full_path.find('?') {
+        (&full_path[..idx], Some(&full_path[idx + 1..]))
+    } else {
+        (full_path, None)
+    };
+
+    let file_path = root_folder.join(requested_path.trim_start_matches('/'));
 
     // Collect headers
     let mut headers = HashMap::new();
@@ -71,6 +83,9 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
         }
     }
 
+    // Prepare to capture POST data
+    let mut post_data: Option<String> = None;
+
     // Handle POST requests
     if method == "POST" {
         let mut content_length: usize = 0;
@@ -78,23 +93,13 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
             content_length = len.parse().unwrap_or(0);
         }
 
-        let mut post_data = vec![0; content_length];
-        stream.read_exact(&mut post_data).await?;
-
-        let response = format!(
-            "{} 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            http_version,
-            post_data.len(),
-            String::from_utf8_lossy(&post_data)
-        );
-        stream.write_all(response.as_bytes()).await?;
-        log_connection(method, &stream, requested_path, "200", "OK").await;
-
-        return Ok(());
+        let mut data = vec![0; content_length];
+        stream.read_exact(&mut data).await?;
+        post_data = Some(String::from_utf8_lossy(&data).to_string());
     }
 
-    // Handle GET requests
-    if method == "GET" {
+    // Handle GET and POST requests
+    if method == "GET" || method == "POST" {
         // Check for forbidden access
         if file_path.starts_with(root_folder.join("forbidden")) {
             let status_code = "403";
@@ -114,24 +119,34 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
 
         // Execute scripts
         if file_path.starts_with(root_folder.join("scripts")) && file_path.is_file() {
-            let (status_code, status_text) =
-                match execute_script(file_path, &mut stream, http_version, &headers, method, requested_path).await {
-                    Ok((status_code, status_text)) => (status_code, status_text),
-                    Err(e) => {
-                        let status_code = "500";
-                        let status_text = "Internal Server Error";
-                        stream
-                            .write_all(
-                                format!(
-                                    "{} {} {}\r\nConnection: close\r\n\r\n",
-                                    http_version, status_code, status_text
-                                )
-                                .as_bytes(),
+            let (status_code, status_text) = match execute_script(
+                file_path,
+                &mut stream,
+                http_version,
+                &headers,
+                method,
+                requested_path,
+                query_string,
+                post_data.as_deref(),
+            )
+            .await
+            {
+                Ok((status_code, status_text)) => (status_code, status_text),
+                Err(_) => {
+                    let status_code = "500";
+                    let status_text = "Internal Server Error";
+                    stream
+                        .write_all(
+                            format!(
+                                "{} {} {}\r\nConnection: close\r\n\r\n",
+                                http_version, status_code, status_text
                             )
-                            .await?;
-                        (status_code, status_text)
-                    }
-                };
+                            .as_bytes(),
+                        )
+                        .await?;
+                    (status_code, status_text)
+                }
+            };
             log_connection(method, &stream, requested_path, status_code, status_text).await;
             return Ok(());
         }
@@ -142,7 +157,15 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
                 Ok(html) => {
                     let status_code = "200";
                     let status_text = "OK";
-                    stream.write_all(format!("{} {} {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}", http_version, status_code, status_text, html).as_bytes()).await?;
+                    stream
+                        .write_all(
+                            format!(
+                                "{} {} {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
+                                http_version, status_code, status_text, html
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                     log_connection(method, &stream, requested_path, status_code, status_text).await;
                     return Ok(());
                 }
@@ -227,8 +250,6 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
 }
 
 
-use std::collections::HashMap;
-
 async fn execute_script(
     script_path: PathBuf,
     stream: &mut TcpStream,
@@ -236,12 +257,23 @@ async fn execute_script(
     headers: &HashMap<String, String>,
     method: &str,
     requested_path: &str,
+    query_string: Option<&str>,  // Optional query string
+    post_data: Option<&str>,     // Optional POST data
 ) -> io::Result<(&'static str, &'static str)> {
     // Prepare environment variables
     let mut env_vars = HashMap::new();
-    
+
+    // Add headers as environment variables
+    for (key, value) in headers {
+        env_vars.insert(key.clone(), value.clone());
+    }
+
+    // Add method and path as environment variables
+    env_vars.insert("Method".to_string(), method.to_string());
+    env_vars.insert("Path".to_string(), requested_path.to_string());
+
     // Parse query string and add to env_vars
-    if let Some(query_str) = requested_path.split('?').nth(1) {
+    if let Some(query_str) = query_string {
         for param in query_str.split('&') {
             if let Some((key, value)) = param.split_once('=') {
                 let var_name = format!("Query_{}", key);
@@ -249,23 +281,28 @@ async fn execute_script(
             }
         }
     }
-    
-    // Other headers
-    for (key, value) in headers {
-        env_vars.insert(key.clone(), value.clone());
+
+    // Add POST data if present
+    if method == "POST" {
+        if let Some(data) = post_data {
+            for param in data.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    let var_name = format!("Query_{}", key);
+                    env_vars.insert(var_name, value.to_string());
+                }
+            }
+        }
     }
-    env_vars.insert("Method".to_string(), method.to_string());
-    env_vars.insert("Path".to_string(), requested_path.to_string());
 
     // Execute the script
     let mut command = Command::new(&script_path);
-    
-    // Set environment variables
+
+    // Set environment variables for the command
     for (key, value) in env_vars {
         command.env(key, value);
     }
 
-    // Capture output
+    // Capture output (stdout and stderr)
     let output = command.output().await?;
 
     let status_code = if output.status.success() {
@@ -287,6 +324,7 @@ async fn execute_script(
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if line.is_empty() {
+            // The first empty line indicates the end of headers
             break;
         }
         response_headers.push(line.to_string());
@@ -295,28 +333,18 @@ async fn execute_script(
     let body_start = stdout.find("\n\n").unwrap_or(0) + 2;
     let body = &stdout[body_start..];
 
-    // Send response
+    // Prepare the full response
     let response = format!(
         "{}\r\n\r\n{}",
         response_headers.join("\r\n"),
         body
     );
+
+    // Send the response
     stream.write_all(response.as_bytes()).await?;
 
     Ok((status_code, status_text))
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -341,10 +369,6 @@ async fn generate_directory_listing(path: &Path, root_folder: &Path) -> io::Resu
     html.push_str("</ul></body></html>");
     Ok(html)
 }
-
-
-
-
 
 async fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path)
@@ -373,7 +397,7 @@ async fn log_connection(
     if let Ok(remote_addr) = stream.peer_addr() {
         let remote_ip = remote_addr.ip().to_string();
         println!(
-            "{} {} /{} -> {} ({})",
+            "{} {} {} -> {} ({})",
             method, remote_ip, requested_path, status_code, status_text
         );
     } else {
