@@ -63,6 +63,36 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     let file_path = root_folder.join(requested_path);
     let http_version = parts[2];
 
+    // Collect headers
+    let mut headers = HashMap::new();
+    for line in &lines[1..] {
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+
+    // Handle POST requests
+    if method == "POST" {
+        let mut content_length: usize = 0;
+        if let Some(len) = headers.get("Content-Length") {
+            content_length = len.parse().unwrap_or(0);
+        }
+
+        let mut post_data = vec![0; content_length];
+        stream.read_exact(&mut post_data).await?;
+
+        let response = format!(
+            "{} 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            http_version,
+            post_data.len(),
+            String::from_utf8_lossy(&post_data)
+        );
+        stream.write_all(response.as_bytes()).await?;
+        log_connection(method, &stream, requested_path, "200", "OK").await;
+
+        return Ok(());
+    }
+
     // Handle GET requests
     if method == "GET" {
         // Check for forbidden access
@@ -85,7 +115,7 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
         // Execute scripts
         if file_path.starts_with(root_folder.join("scripts")) && file_path.is_file() {
             let (status_code, status_text) =
-                match execute_script(file_path, &mut stream, http_version, method).await {
+                match execute_script(file_path, &mut stream, http_version, &headers, method, requested_path).await {
                     Ok((status_code, status_text)) => (status_code, status_text),
                     Err(e) => {
                         let status_code = "500";
@@ -180,7 +210,7 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
         }
     }
 
-    // If the method is not GET, return 405 Method Not Allowed
+    // If the method is not GET or POST, return 405 Method Not Allowed
     let status_code = "405";
     let status_text = "Method Not Allowed";
     stream
@@ -197,16 +227,31 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
 }
 
 
+use std::collections::HashMap;
+
 async fn execute_script(
     script_path: PathBuf,
     stream: &mut TcpStream,
     http_version: &str,
-    method: &str, // Pass the HTTP method as an argument
+    headers: &HashMap<String, String>,
+    method: &str,
+    requested_path: &str,
 ) -> io::Result<(&'static str, &'static str)> {
-    let mut command = Command::new(&script_path);
+    // Prepare environment variables
+    let mut env_vars = HashMap::new();
+    for (key, value) in headers {
+        env_vars.insert(key.clone(), value.clone());
+    }
+    env_vars.insert("Method".to_string(), method.to_string());
+    env_vars.insert("Path".to_string(), requested_path.to_string());
 
-    // Pass the HTTP method as an environment variable
-    command.env("REQUEST_METHOD", method);
+    // Execute the script
+    let mut command = Command::new(&script_path);
+    
+    // Set environment variables
+    for (key, value) in env_vars {
+        command.env(key, value);
+    }
 
     // Capture both stdout and stderr
     let output = command.output().await?;
@@ -222,15 +267,50 @@ async fn execute_script(
         "Internal Server Error"
     };
 
+    let mut response_headers = vec![
+        format!("{} {} {}", http_version, status_code, status_text),
+        "Connection: close".to_string(),
+    ];
+
     let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.is_empty() {
+            // The first empty line indicates the end of headers
+            break;
+        }
+        response_headers.push(line.to_string());
+    }
+
+    let body_start = stdout.find("\n\n").unwrap_or(0) + 2;
+    let body = &stdout[body_start..];
+
+    // Prepare the full response
     let response = format!(
-        "{} {} {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
-        http_version, status_code, status_text, stdout.trim()
+        "{}\r\n\r\n{}",
+        response_headers.join("\r\n"),
+        body
     );
 
+    // Send the response
     stream.write_all(response.as_bytes()).await?;
+
     Ok((status_code, status_text))
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 async fn generate_directory_listing(path: &Path, root_folder: &Path) -> io::Result<String> {
     let mut html = String::from("<html><body><h1>Directory listing</h1><ul>");
@@ -252,6 +332,10 @@ async fn generate_directory_listing(path: &Path, root_folder: &Path) -> io::Resu
     html.push_str("</ul></body></html>");
     Ok(html)
 }
+
+
+
+
 
 async fn read_file(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path)
