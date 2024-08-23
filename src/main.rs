@@ -41,6 +41,7 @@ async fn main() -> io::Result<()> {
 
 use std::collections::HashMap;
 
+
 async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Result<()> {
     let mut buffer = [0; 4096];
     let n = stream.read(&mut buffer).await?;
@@ -74,7 +75,6 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     let file_path = root_folder.join(requested_path.trim_start_matches('/'));
 
     // Check if the requested file is forbidden
-
     if is_forbidden_file(&file_path, &root_folder) {
         send_response(
             &mut stream,
@@ -85,9 +85,7 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
             "<html>403 Forbidden</html>",
         )
         .await?;
-
         log_connection(method, &stream, requested_path, "403", "Forbidden").await;
-
         return Ok(());
     }
 
@@ -118,18 +116,16 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     if method == "GET" || method == "POST" {
         // Check for forbidden access
         if file_path.starts_with(root_folder.join("forbidden")) {
-            let status_code = "403";
-            let status_text = "Forbidden";
-            stream
-                .write_all(
-                    format!(
-                        "{} {} {}\r\nConnection: close\r\n\r\n",
-                        http_version, status_code, status_text
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            log_connection(method, &stream, requested_path, status_code, status_text).await;
+            send_response(
+                &mut stream,
+                http_version,
+                "403",
+                "Forbidden",
+                "text/plain; charset=utf-8",
+                "<html>403 Forbidden</html>",
+            )
+            .await?;
+            log_connection(method, &stream, requested_path, "403", "Forbidden").await;
             return Ok(());
         }
 
@@ -151,15 +147,15 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
                 Err(_) => {
                     let status_code = "500";
                     let status_text = "Internal Server Error";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nConnection: close\r\n\r\n",
-                                http_version, status_code, status_text
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
+                    send_response(
+                        &mut stream,
+                        http_version,
+                        status_code,
+                        status_text,
+                        "text/plain",
+                        "<html>500 Internal Server Error</html>",
+                    )
+                    .await?;
                     (status_code, status_text)
                 }
             };
@@ -173,30 +169,30 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
                 Ok(html) => {
                     let status_code = "200";
                     let status_text = "OK";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
-                                http_version, status_code, status_text, html
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
+                    send_response(
+                        &mut stream,
+                        http_version,
+                        status_code,
+                        status_text,
+                        "text/html; charset=utf-8",
+                        &html,
+                    )
+                    .await?;
                     log_connection(method, &stream, requested_path, status_code, status_text).await;
                     return Ok(());
                 }
                 Err(_) => {
                     let status_code = "500";
                     let status_text = "Internal Server Error";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nConnection: close\r\n\r\n",
-                                http_version, status_code, status_text
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
+                    send_response(
+                        &mut stream,
+                        http_version,
+                        status_code,
+                        status_text,
+                        "text/plain",
+                        "<html>500 Internal Server Error</html>",
+                    )
+                    .await?;
                     log_connection(method, &stream, requested_path, status_code, status_text).await;
                     return Ok(());
                 }
@@ -219,15 +215,15 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
                 Err(_) => {
                     let status_code = "404";
                     let status_text = "Not Found";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nConnection: close\r\n\r\n",
-                                http_version, status_code, status_text
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
+                    send_response(
+                        &mut stream,
+                        http_version,
+                        status_code,
+                        status_text,
+                        "text/plain",
+                        "<html>404 Not Found</html>",
+                    )
+                    .await?;
                     log_connection(method, &stream, requested_path, status_code, status_text).await;
                     return Ok(());
                 }
@@ -235,15 +231,15 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
         } else {
             let status_code = "404";
             let status_text = "Not Found";
-            stream
-                .write_all(
-                    format!(
-                        "{} {} {}\r\nConnection: close\r\n\r\n",
-                        http_version, status_code, status_text
-                    )
-                    .as_bytes(),
-                )
-                .await?;
+            send_response(
+                &mut stream,
+                http_version,
+                status_code,
+                status_text,
+                "text/plain",
+                "<html>404 Not Found</html>",
+            )
+            .await?;
             log_connection(method, &stream, requested_path, status_code, status_text).await;
             return Ok(());
         }
@@ -252,18 +248,22 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     // If the method is not GET or POST, return 405 Method Not Allowed
     let status_code = "405";
     let status_text = "Method Not Allowed";
-    stream
-        .write_all(
-            format!(
-                "{} {} {}\r\nConnection: close\r\n\r\n",
-                http_version, status_code, status_text
-            )
-            .as_bytes(),
-        )
-        .await?;
+    send_response(
+        &mut stream,
+        http_version,
+        status_code,
+        status_text,
+        "text/plain",
+        "<html>405 Method Not Allowed</html>",
+    )
+    .await?;
     log_connection(method, &stream, requested_path, status_code, status_text).await;
     Ok(())
 }
+
+
+
+
 
 fn is_forbidden_file(file_path: &Path, root_folder: &Path) -> bool {
     // Check if the file is outside the root folder (path traversal protection)
