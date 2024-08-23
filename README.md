@@ -25,7 +25,7 @@ La fonction async fn read_file lit le contenu d'un fichier et retourne ce conten
 La fonction fn get_mime_type détermine le type MIME d'un fichier en fonction de son extension pour spécifier le type de contenu dans la réponse HTTP.
 
 La fonction async fn log_connection enregistre les informations sur la connexion, y compris la méthode HTTP, l'adresse IP du client, le chemin demandé, et le code de statut de la réponse.
-pour les tests
+
 ```bash
 cargo build
 export PATH=/workspaces/rustywebserver-MkI21/target/debug:$PATH
