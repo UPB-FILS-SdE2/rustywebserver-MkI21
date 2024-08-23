@@ -74,6 +74,24 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
 
     let file_path = root_folder.join(requested_path.trim_start_matches('/'));
 
+
+    // Check if the requested file exists
+    if !file_path.exists() {
+        let status_code = "404";
+        let status_text = "Not Found";
+        send_response(
+            &mut stream,
+            http_version,
+            status_code,
+            status_text,
+            "text/plain",
+            "<html>404 Not Found</html>",
+        )
+        .await?;
+        log_connection(method, &stream, requested_path, status_code, status_text).await;
+        return Ok(());
+    }
+
     // Check if the requested file is forbidden
     if is_forbidden_file(&file_path, &root_folder) {
         send_response(
