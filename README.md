@@ -2,7 +2,8 @@
 # Rustwebserver
 
 Detail the homework implementation.
-pour lancer le serveur
+
+pour lancer le serveur:
 ```bash
 rustywebserver PORT <Folder>
 ```
