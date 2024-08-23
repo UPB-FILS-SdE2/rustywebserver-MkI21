@@ -1,11 +1,11 @@
+use std::collections::HashMap;
 use std::env;
-use std::fs;
+use std::fs::{self, Metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
@@ -22,7 +22,6 @@ async fn main() -> io::Result<()> {
         .canonicalize()
         .expect("Invalid root folder path");
 
-    // Print root folder and server listening message once
     println!("Root folder: {:?}", root_folder.display());
     println!("Server listening on 0.0.0.0:{}", port);
 
@@ -38,10 +37,6 @@ async fn main() -> io::Result<()> {
         });
     }
 }
-
-
-use std::collections::HashMap;
-
 
 async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Result<()> {
     let mut buffer = [0; 4096];
@@ -66,7 +61,6 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     let full_path = parts[1];
     let http_version = parts[2];
 
-    // Extract requested path and query string
     let (requested_path, query_string) = if let Some(idx) = full_path.find('?') {
         (&full_path[..idx], Some(&full_path[idx + 1..]))
     } else {
@@ -75,7 +69,21 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
 
     let file_path = root_folder.join(requested_path.trim_start_matches('/'));
 
-    // Collect headers
+    // Check if the requested file is forbidden
+    if is_forbidden_file(&file_path, &root_folder) {
+        send_response(
+            &mut stream,
+            http_version,
+            "403",
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            "<html>403 Forbidden</html>",
+        )
+        .await?;
+        log_connection(method, &stream, requested_path, "403", "Forbidden").await;
+        return Ok(());
+    }
+
     let mut headers = HashMap::new();
     for line in &lines[1..] {
         if let Some((key, value)) = line.split_once(':') {
@@ -83,10 +91,8 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
         }
     }
 
-    // Prepare to capture POST data
     let mut post_data: Option<String> = None;
 
-    // Handle POST requests
     if method == "POST" {
         let mut content_length: usize = 0;
         if let Some(len) = headers.get("Content-Length") {
@@ -98,155 +104,116 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
         post_data = Some(String::from_utf8_lossy(&data).to_string());
     }
 
-    // Handle GET and POST requests
     if method == "GET" || method == "POST" {
-        // Check for forbidden access
-        if file_path.starts_with(root_folder.join("forbidden")) {
-            let status_code = "403";
-            let status_text = "Forbidden";
-            stream
-                .write_all(
-                    format!(
-                        "{} {} {}\r\nConnection: close\r\n\r\n",
-                        http_version, status_code, status_text
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            log_connection(method, &stream, requested_path, status_code, status_text).await;
-            return Ok(());
-        }
-
-        // Execute scripts
-        if file_path.starts_with(root_folder.join("scripts")) && file_path.is_file() {
-            let (status_code, status_text) = match execute_script(
-                file_path,
-                &mut stream,
-                http_version,
-                &headers,
-                method,
-                requested_path,
-                query_string,
-                post_data.as_deref(),
-            )
-            .await
-            {
-                Ok((status_code, status_text)) => (status_code, status_text),
-                Err(_) => {
-                    let status_code = "500";
-                    let status_text = "Internal Server Error";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nConnection: close\r\n\r\n",
-                                http_version, status_code, status_text
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    (status_code, status_text)
-                }
-            };
-            log_connection(method, &stream, requested_path, status_code, status_text).await;
-            return Ok(());
-        }
-
-        // Serve files and directories
         if file_path.is_dir() {
             match generate_directory_listing(&file_path, &root_folder).await {
                 Ok(html) => {
-                    let status_code = "200";
-                    let status_text = "OK";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{}",
-                                http_version, status_code, status_text, html
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    log_connection(method, &stream, requested_path, status_code, status_text).await;
-                    return Ok(());
+                    send_response(&mut stream, http_version, "200", "OK", "text/html; charset=utf-8", &html).await?;
                 }
                 Err(_) => {
-                    let status_code = "500";
-                    let status_text = "Internal Server Error";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nConnection: close\r\n\r\n",
-                                http_version, status_code, status_text
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    log_connection(method, &stream, requested_path, status_code, status_text).await;
-                    return Ok(());
+                    send_response(&mut stream, http_version, "500", "Internal Server Error", "text/plain; charset=utf-8", "An error occurred while generating directory listing").await?;
                 }
             }
+            log_connection(method, &stream, requested_path, "200", "OK").await;
+            return Ok(());
         } else if file_path.exists() && file_path.is_file() {
-            match read_file(&file_path).await {
-                Ok(contents) => {
-                    let mime_type = get_mime_type(&file_path);
-                    let status_code = "200";
-                    let status_text = "OK";
-                    let header = format!(
-                        "{} {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        http_version, status_code, status_text, mime_type, contents.len()
-                    );
-                    stream.write_all(header.as_bytes()).await?;
-                    stream.write_all(&contents).await?;
-                    log_connection(method, &stream, requested_path, status_code, status_text).await;
-                    return Ok(());
+            // Check if the file is a script
+            if file_path.extension().map_or(false, |ext| ext == "sh" || ext == "py") {
+                // Execute the script
+                match execute_script(
+                    file_path.clone(),
+                    &mut stream,
+                    http_version,
+                    &headers,
+                    method,
+                    requested_path,
+                    query_string,
+                    post_data.as_deref()
+                ).await {
+                    Ok((status_code, status_text)) => {
+                        log_connection(method, &stream, requested_path, status_code, status_text).await;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        send_response(&mut stream, http_version, "500", "Internal Server Error", "text/plain; charset=utf-8", "An error occurred while executing the script").await?;
+                        log_connection(method, &stream, requested_path, "500", "Internal Server Error").await;
+                        return Ok(());
+                    }
                 }
-                Err(_) => {
-                    let status_code = "404";
-                    let status_text = "Not Found";
-                    stream
-                        .write_all(
-                            format!(
-                                "{} {} {}\r\nConnection: close\r\n\r\n",
-                                http_version, status_code, status_text
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    log_connection(method, &stream, requested_path, status_code, status_text).await;
-                    return Ok(());
+            } else {
+                // Serve static file
+                match read_file(&file_path).await {
+                    Ok(contents) => {
+                        let mime_type = get_mime_type(&file_path);
+                        send_response(
+                            &mut stream,
+                            http_version,
+                            "200",
+                            "OK",
+                            mime_type,
+                            &String::from_utf8_lossy(&contents),
+                        ).await?;
+                        log_connection(method, &stream, requested_path, "200", "OK").await;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        send_response(&mut stream, http_version, "500", "Internal Server Error", "text/plain; charset=utf-8", "An error occurred while reading the file").await?;
+                        log_connection(method, &stream, requested_path, "500", "Internal Server Error").await;
+                        return Ok(());
+                    }
                 }
             }
         } else {
-            let status_code = "404";
-            let status_text = "Not Found";
-            stream
-                .write_all(
-                    format!(
-                        "{} {} {}\r\nConnection: close\r\n\r\n",
-                        http_version, status_code, status_text
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            log_connection(method, &stream, requested_path, status_code, status_text).await;
+            send_response(&mut stream, http_version, "404", "Not Found", "text/plain; charset=utf-8", "The requested file was not found").await?;
+            log_connection(method, &stream, requested_path, "404", "Not Found").await;
             return Ok(());
+        }
+    } else {
+        send_response(&mut stream, http_version, "405", "Method Not Allowed", "text/plain; charset=utf-8", "The method is not allowed").await?;
+        log_connection(method, &stream, requested_path, "405", "Method Not Allowed").await;
+        return Ok(());
+    }
+}
+
+use std::path::Component;
+
+fn is_forbidden_file(file_path: &Path, root_folder: &Path) -> bool {
+    // Check if the file is outside the root folder (path traversal protection)
+    if let Ok(canonical_path) = file_path.canonicalize() {
+        if !canonical_path.starts_with(root_folder) {
+            return true;
+        }
+    } else {
+        return true;
+    }
+
+    // Define specific forbidden directories or files
+    let forbidden_patterns = vec![
+        "forbidden", // Forbidden directory
+        "restricted_area.txt", // Specific file
+        "scripts/../", // Example of a path pattern
+    ];
+
+    // Check if the file path contains any forbidden patterns
+    for pattern in &forbidden_patterns {
+        if file_path.to_str().map_or(false, |s| s.contains(pattern)) {
+            return true;
         }
     }
 
-    // If the method is not GET or POST, return 405 Method Not Allowed
-    let status_code = "405";
-    let status_text = "Method Not Allowed";
-    stream
-        .write_all(
-            format!(
-                "{} {} {}\r\nConnection: close\r\n\r\n",
-                http_version, status_code, status_text
-            )
-            .as_bytes(),
-        )
-        .await?;
-    log_connection(method, &stream, requested_path, status_code, status_text).await;
-    Ok(())
+    // Additional example: block access to hidden files (starting with '.')
+    if file_path.file_name().and_then(|name| name.to_str()).map_or(false, |s| s.starts_with('.')) {
+        return true;
+    }
+
+    // Example: Check if the file is in a forbidden directory (adjust as needed)
+    if let Some(parent) = file_path.parent() {
+        if forbidden_patterns.iter().any(|pattern| parent.ends_with(pattern)) {
+            return true;
+        }
+    }
+
+    false
 }
 
 
@@ -347,7 +314,25 @@ async fn execute_script(
 }
 
 
-
+async fn send_response(
+    stream: &mut TcpStream,
+    http_version: &str,
+    status_code: &str,
+    status_text: &str,
+    content_type: &str,
+    body: &str,
+) -> io::Result<()> {
+    let response = format!(
+        "{} {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        http_version,
+        status_code,
+        status_text,
+        content_type,
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await
+}
 
 async fn generate_directory_listing(path: &Path, root_folder: &Path) -> io::Result<String> {
     let mut html = String::from("<html><body><h1>Directory listing</h1><ul>");
