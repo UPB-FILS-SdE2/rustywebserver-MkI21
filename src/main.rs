@@ -75,6 +75,31 @@ async fn handle_request(mut stream: TcpStream, root_folder: PathBuf) -> io::Resu
     let file_path = root_folder.join(requested_path.trim_start_matches('/'));
 
 
+    let mut headers = HashMap::new();
+    for line in &lines[1..] {
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+
+    let mut post_data: Option<String> = None;
+
+    // Handle POST requests
+    if method == "POST" {
+        let mut content_length: usize = 0;
+        if let Some(len) = headers.get("Content-Length") {
+            content_length = len.parse().unwrap_or(0);
+        }
+
+        let mut data = vec![0; content_length];
+        stream.read_exact(&mut data).await?;
+        post_data = Some(String::from_utf8_lossy(&data).to_string());
+    }
+
+    // Combine query string and POST data
+    let combined_query = combine_query_and_post_data(query_string, post_data.as_deref());
+
+
     // Check if the requested file exists
     if !file_path.exists() {
         let status_code = "404";
@@ -334,6 +359,28 @@ fn is_forbidden_file(file_path: &Path, root_folder: &Path) -> bool {
     false
 }
 
+
+// New function to combine query string and POST data
+fn combine_query_and_post_data(
+    query_string: Option<&str>,
+    post_data: Option<&str>,
+) -> String {
+    let mut combined = String::new();
+
+    if let Some(query) = query_string {
+        combined.push_str(query);
+    }
+
+    if let Some(post) = post_data {
+        if !combined.is_empty() {
+            combined.push('&');
+        }
+        combined.push_str(post);
+    }
+
+    combined
+}
+
 async fn execute_script(
     script_path: PathBuf,
     stream: &mut TcpStream,
@@ -342,7 +389,7 @@ async fn execute_script(
     method: &str,
     requested_path: &str,
     query_string: Option<&str>, // Optional query string
-    post_data: Option<&str>,    // Optional POST data
+    combined_query: Option<&str>,    // Optional POST data
 ) -> io::Result<(&'static str, &'static str)> {
     // Prepare environment variables
     let mut env_vars = HashMap::new();
@@ -368,12 +415,21 @@ async fn execute_script(
 
     // Add POST data if present
     if method == "POST" {
-        if let Some(data) = post_data {
+        if let Some(data) = combined_query {
             for param in data.split('&') {
                 if let Some((key, value)) = param.split_once('=') {
                     let var_name = format!("Query_{}", key);
                     env_vars.insert(var_name, value.to_string());
                 }
+            }
+        }
+    }
+
+    if let Some(query_str) = combined_query {
+        for param in query_str.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                let var_name = format!("Query_{}", key);
+                env_vars.insert(var_name, value.to_string());
             }
         }
     }
