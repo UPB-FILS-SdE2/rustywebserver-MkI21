@@ -2,7 +2,6 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::str;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -382,7 +381,6 @@ fn combine_query_and_post_data(
     combined
 }
 
-
 async fn execute_script(
     script_path: PathBuf,
     stream: &mut TcpStream,
@@ -390,63 +388,11 @@ async fn execute_script(
     headers: &HashMap<String, String>,
     method: &str,
     requested_path: &str,
-    query_string: Option<&str>,
-    combined_query: Option<&str>,
+    query_string: Option<&str>, // Optional query string
+    combined_query: Option<&str>,    // Optional POST data
 ) -> io::Result<(&'static str, &'static str)> {
     // Prepare environment variables
     let mut env_vars = HashMap::new();
-    
-    let mut command = Command::new(&script_path);
-
-    // Set up the environment for the command
-    command.env("REQUEST_METHOD", method);
-    if let Some(query) = query_string {
-        command.env("QUERY_STRING", query);
-    }
-
-    // Ensure we can pipe data to and from the command
-    command.stdin(Stdio::piped()).stdout(Stdio::piped());
-
-    // Spawn the child process
-    let mut child = command.spawn()?;
-
-    // If we have POST data, send it to the script's stdin
-    if let Some(post_data) = combined_query {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(post_data.as_bytes()).await?;
-        }
-    }
-
-    // Wait for the script to complete and capture its output
-    let output = child.wait_with_output().await?;
-
-    let status_code = if output.status.success() {
-        "200"
-    } else {
-        "500"
-    };
-    let status_text = if output.status.success() {
-        "OK"
-    } else {
-        "Internal Server Error"
-    };
-
-    // Collect the script's output
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Prepare the HTTP response
-    let response = format!(
-        "{} {} {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        http_version,
-        status_code,
-        status_text,
-        stdout.len(),
-        stdout
-    );
-
-    // Send the response back to the client
-    stream.write_all(response.as_bytes()).await?;
-
 
     // Add headers as environment variables
     for (key, value) in headers {
@@ -468,6 +414,27 @@ async fn execute_script(
     }
 
     // Add POST data if present
+    if method == "POST" {
+        if let Some(data) = combined_query {
+            for param in data.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    let var_name = format!("Query_{}", key);
+                    env_vars.insert(var_name, value.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(query_str) = combined_query {
+        for param in query_str.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                let var_name = format!("Query_{}", key);
+                env_vars.insert(var_name, value.to_string());
+            }
+        }
+    }
+
+    // Execute the script
     let mut command = Command::new(&script_path);
 
     // Set environment variables for the command
@@ -475,43 +442,44 @@ async fn execute_script(
         command.env(key, value);
     }
 
-    // Redirect POST data to the script's stdin
-    if let Some(post_data) = combined_query {
-        let mut child = command.stdin(Stdio::piped())
-                              .stdout(Stdio::piped())
-                              .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(post_data.as_bytes()).await?;
-        }
-        let output = child.wait_with_output().await?;
+    // Capture output (stdout and stderr)
+    let output = command.output().await?;
 
-        // Process output and send response
-        let status_code = if output.status.success() { "200" } else { "500" };
-        let status_text = if output.status.success() { "OK" } else { "Internal Server Error" };
-        
-        let response_body = String::from_utf8_lossy(&output.stdout).to_string();
-        let response = format!(
-            "{} {} {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            http_version, status_code, status_text, response_body.len(), response_body
-        );
-
-        stream.write_all(response.as_bytes()).await?;
-        return Ok((status_code, status_text));
+    let status_code = if output.status.success() {
+        "200"
     } else {
-        // If there's no POST data, just run the script normally
-        let output = command.output().await?;
-        let status_code = if output.status.success() { "200" } else { "500" };
-        let status_text = if output.status.success() { "OK" } else { "Internal Server Error" };
+        "500"
+    };
+    let status_text = if output.status.success() {
+        "OK"
+    } else {
+        "Internal Server Error"
+    };
 
-        let response_body = String::from_utf8_lossy(&output.stdout).to_string();
-        let response = format!(
-            "{} {} {}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            http_version, status_code, status_text, response_body.len(), response_body
-        );
+    let mut response_headers = vec![
+        format!("{} {} {}", http_version, status_code, status_text),
+        "Connection: close".to_string(),
+    ];
 
-        stream.write_all(response.as_bytes()).await?;
-        return Ok((status_code, status_text));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.is_empty() {
+            // The first empty line indicates the end of headers
+            break;
+        }
+        response_headers.push(line.to_string());
     }
+
+    let body_start = stdout.find("\n\n").unwrap_or(0) + 2;
+    let body = &stdout[body_start..];
+
+    // Prepare the full response
+    let response = format!("{}\r\n\r\n{}", response_headers.join("\r\n"), body);
+
+    // Send the response
+    stream.write_all(response.as_bytes()).await?;
+
+    Ok((status_code, status_text))
 }
 
 
